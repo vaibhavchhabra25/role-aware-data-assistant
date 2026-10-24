@@ -1,0 +1,78 @@
+# Table access per role. Single source of truth for:
+#   - which schema the LLM sees (context layer)
+#   - the sqlglot allowlist check (validation layer)
+#   - Postgres GRANTs in scripts/setup_db_roles.sql (database layer)
+#
+# excluded_columns are enforced with column-level GRANTs, so the DB rejects
+# them even if the validator is bypassed.
+#
+# actions: the write actions a role may request (each still needs the user's
+# confirmation). Writes run under dedicated writer logins, see app/actions.
+
+roles:
+  inventory_manager:
+    label: Inventory Manager
+    db_role: role_inventory
+    description: >
+      Stock levels by warehouse, item master and categories, and every stock
+      movement (receipts, issues, transfers, adjustments). No suppliers,
+      purchase orders or prices.
+    tables:
+      inv_items: Item master, needed for every stock question.
+      inv_categories: Category names for grouping items.
+      inv_sub_categories: Sub-category names for grouping items.
+      inv_sub_categories_2: Detailed item families and naming standards.
+      inv_field_definitions: Custom item fields (alias, legacy code); part of the item master.
+      inv_locations: Warehouses, needed for stock-by-location.
+      inv_current_stock: On-hand quantity and min/max levels, the core of the role.
+      inv_transactions: Stock movements, needed for consumption and movement history.
+      inv_issued_to_targets: Departments that stock is issued to.
+    excluded_columns:
+      inv_transactions: [unit_cost, currency]  # costing is commercial data, not needed to run the store
+    actions: [adjust_stock]
+    starter_questions:
+      - Which items are below their reorder level right now?
+      - Show the monthly trend of stock issued to the shop floors.
+      - Which items are out of stock at warehouse 132-1?
+      - Which departments take the most stock?
+
+  procurement_manager:
+    label: Procurement Manager
+    db_role: role_procurement
+    description: >
+      Suppliers, purchase orders and their lines, prices, deliveries against
+      POs, payment terms and goods received without a PO. Sees the item and
+      warehouse names, but not stock levels or stock movements.
+    tables:
+      proc_vendors: Supplier master, the core of the role.
+      proc_purchase_orders: PO headers, values, status and expected dates.
+      proc_po_lines: What was ordered, at what price, and how much has arrived.
+      proc_po_receipts: Deliveries against PO lines, needed for supplier delay analysis.
+      proc_po_payment_tranches: Payment schedule per PO.
+      proc_po_line_regularisations: Quantity corrections on over/under-delivered lines.
+      proc_unexpected_receipt_headers: Goods that arrived without a PO, to be regularised.
+      proc_unexpected_receipts: Line items of unexpected receipts.
+      inv_items: Shared, to name what is being bought.
+      inv_categories: Shared, for spend by category.
+      inv_sub_categories: Shared, for spend by sub-category.
+      inv_locations: Shared, to name the warehouse a PO or receipt is for.
+    excluded_columns: {}
+    actions: [create_purchase_order]
+    starter_questions:
+      - Which open purchase orders are overdue?
+      - Which suppliers deliver late most often?
+      - How has our monthly purchase spend changed?
+      - Who are our top 10 suppliers by spend?
+
+  owner:
+    label: Owner
+    db_role: role_owner
+    description: Everything, including cross-functional questions such as stock value and reorder planning.
+    tables: all
+    excluded_columns: {}
+    actions: [create_purchase_order, adjust_stock]
+    starter_questions:
+      - Which items are below reorder level and have no open purchase order?
+      - What is the total value of our current stock?
+      - How concentrated is our spend across suppliers?
+      - Compare stock received vs stock issued each month.

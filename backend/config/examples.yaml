@@ -1,0 +1,322 @@
+# Few-shot examples: question -> SQL, retrieved by keyword overlap for the SQL generator.
+#
+# - A role only ever sees examples whose tables are all in its allowlist (computed from the SQL).
+# - {as_of} is replaced with DATA_AS_OF. Never use CURRENT_DATE / NOW().
+# - caveats: small count queries whose result fills {n}; they turn missing-data rules into
+#   real numbers in the answer. Shown only when n > 0.
+# - Questions are worded differently from evals/test_cases.yaml so evals still test generalisation.
+# - tests/test_examples.py validates every SQL and runs it as the narrowest role that can.
+
+# ------------------------------------------------------------------ inventory
+
+- question: "Which stock needs reordering?"
+  format: table
+  sql: |
+    SELECT i.item_code, i.name, l.name AS warehouse, s.quantity, s.min_stock_level,
+           s.min_stock_level - s.quantity AS shortfall, i.unit
+    FROM inv_current_stock s
+    JOIN inv_items i ON i.id = s.item_id
+    JOIN inv_locations l ON l.id = s.location_id
+    WHERE s.min_stock_level > 0 AND s.quantity < s.min_stock_level
+      AND l.is_active AND i.status = 'active'
+    ORDER BY shortfall DESC
+  caveats:
+    - text: "{n} stock rows have no reorder level set and were not checked."
+      sql: "SELECT count(*) FROM inv_current_stock WHERE min_stock_level = 0"
+
+- question: "How much SS Sheet 304 1250x2500x1.5mm do we have and where?"
+  format: table
+  sql: |
+    SELECT i.item_code, i.name, l.name AS warehouse, s.quantity, i.unit
+    FROM inv_current_stock s
+    JOIN inv_items i ON i.id = s.item_id
+    JOIN inv_locations l ON l.id = s.location_id
+    WHERE replace(i.name, '×', 'x') ILIKE '%ss sheet%304%1250x2500x1.5mm%'
+    ORDER BY i.item_code, l.name
+
+- question: "What has run out completely at warehouse 132-2?"
+  format: table
+  sql: |
+    SELECT i.item_code, i.name, s.min_stock_level, s.last_transaction_at::date AS last_movement
+    FROM inv_current_stock s
+    JOIN inv_items i ON i.id = s.item_id
+    JOIN inv_locations l ON l.id = s.location_id
+    WHERE l.name = '132-2' AND s.quantity = 0
+    ORDER BY s.min_stock_level DESC, i.item_code
+
+- question: "Which items did we issue the most over the last two months?"
+  format: table
+  # Quantities in kg and pcs can't be ranked against each other: top 5 within each unit.
+  sql: |
+    WITH issued AS (
+      SELECT i.item_code, i.name, i.unit, sum(-t.quantity) AS quantity_issued,
+             row_number() OVER (PARTITION BY i.unit ORDER BY sum(-t.quantity) DESC) AS rank_in_unit
+      FROM inv_transactions t
+      JOIN inv_items i ON i.id = t.item_id
+      WHERE t.transaction_type = 'outbound'
+        AND t.created_at >= DATE '{as_of}' - INTERVAL '2 months'
+      GROUP BY i.item_code, i.name, i.unit
+    )
+    SELECT unit, item_code, name, quantity_issued
+    FROM issued
+    WHERE rank_in_unit <= 5
+    ORDER BY unit, quantity_issued DESC
+
+- question: "How has issuing activity changed month by month?"
+  format: chart
+  sql: |
+    SELECT to_char(date_trunc('month', t.created_at), 'YYYY-MM') AS month,
+           count(*) AS issues, count(DISTINCT t.item_id) AS items_issued
+    FROM inv_transactions t
+    WHERE t.transaction_type = 'outbound'
+      AND t.created_at >= date_trunc('month', DATE '{as_of}') - INTERVAL '5 months'
+    GROUP BY 1
+    ORDER BY 1
+
+- question: "Which departments take the most stock?"
+  format: chart
+  sql: |
+    SELECT coalesce(d.name, 'Not recorded') AS department, count(*) AS issues
+    FROM inv_transactions t
+    LEFT JOIN inv_issued_to_targets d ON d.id = t.issued_to_id
+    WHERE t.transaction_type = 'outbound'
+    GROUP BY 1
+    ORDER BY issues DESC
+
+- question: "How many items does each category have?"
+  format: chart
+  sql: |
+    SELECT coalesce(c.name, 'Not recorded') AS category, count(*) AS items
+    FROM inv_items i
+    LEFT JOIN inv_categories c ON c.id = i.category_id
+    WHERE i.status = 'active'
+    GROUP BY 1
+    ORDER BY items DESC
+
+# ------------------------------------------------------------------ procurement
+
+- question: "Show the orders we are still waiting for."
+  format: table
+  sql: |
+    SELECT po.po_number, v.name AS supplier, po.placed_on, po.status,
+           (po.expected_delivery_date ->> (json_array_length(po.expected_delivery_date) - 1))::date AS expected_delivery,
+           po.total_amount
+    FROM proc_purchase_orders po
+    JOIN proc_vendors v ON v.id = po.vendor_id
+    WHERE po.status IN ('placed', 'partial')
+    ORDER BY expected_delivery NULLS LAST
+
+- question: "Which supplier orders are late?"
+  format: table
+  sql: |
+    WITH open_po AS (
+      SELECT po.po_number, po.vendor_id, po.placed_on, po.total_amount,
+             (po.expected_delivery_date ->> (json_array_length(po.expected_delivery_date) - 1))::date AS expected
+      FROM proc_purchase_orders po
+      WHERE po.status IN ('placed', 'partial')
+    )
+    SELECT o.po_number, v.name AS supplier, o.placed_on, o.expected AS expected_delivery,
+           DATE '{as_of}' - o.expected AS days_overdue, o.total_amount
+    FROM open_po o
+    JOIN proc_vendors v ON v.id = o.vendor_id
+    WHERE o.expected < DATE '{as_of}'
+    ORDER BY days_overdue DESC
+  caveats:
+    - text: "{n} open POs have no expected delivery date, so they could not be checked."
+      sql: |
+        SELECT count(*) FROM proc_purchase_orders
+        WHERE status IN ('placed', 'partial')
+          AND (expected_delivery_date IS NULL OR json_array_length(expected_delivery_date) = 0)
+
+- question: "How reliable are our suppliers on delivery dates?"
+  format: table
+  sql: |
+    SELECT v.name AS supplier, count(*) AS deliveries,
+           count(*) FILTER (WHERE r.received_at::date > (po.expected_delivery_date ->> 0)::date) AS late_deliveries,
+           round(100.0 * count(*) FILTER (WHERE r.received_at::date > (po.expected_delivery_date ->> 0)::date) / count(*)) AS pct_late,
+           round(avg(r.received_at::date - (po.expected_delivery_date ->> 0)::date), 1) AS avg_days_late
+    FROM proc_po_receipts r
+    JOIN proc_po_lines l ON l.id = r.po_line_id
+    JOIN proc_purchase_orders po ON po.id = l.po_id
+    JOIN proc_vendors v ON v.id = po.vendor_id
+    WHERE json_array_length(po.expected_delivery_date) > 0
+    GROUP BY v.name
+    ORDER BY avg_days_late DESC
+  caveats:
+    - text: "{n} deliveries were on POs with no promised date and are not included."
+      sql: |
+        SELECT count(*) FROM proc_po_receipts r
+        JOIN proc_po_lines l ON l.id = r.po_line_id
+        JOIN proc_purchase_orders po ON po.id = l.po_id
+        WHERE po.expected_delivery_date IS NULL OR json_array_length(po.expected_delivery_date) = 0
+
+- question: "Plot purchase spend per month for the last year."
+  format: chart
+  sql: |
+    SELECT to_char(date_trunc('month', placed_on), 'YYYY-MM') AS month, count(*) AS purchase_orders,
+           sum(total_amount) AS spend
+    FROM proc_purchase_orders
+    WHERE placed_on >= DATE '{as_of}' - INTERVAL '12 months'
+    GROUP BY 1
+    ORDER BY 1
+
+- question: "Who are our biggest suppliers by value?"
+  format: chart
+  sql: |
+    SELECT v.name AS supplier, count(*) AS purchase_orders, sum(po.total_amount) AS spend
+    FROM proc_purchase_orders po
+    JOIN proc_vendors v ON v.id = po.vendor_id
+    GROUP BY v.name
+    ORDER BY spend DESC
+    LIMIT 10
+
+- question: "How many purchase orders went out in July?"
+  format: text
+  sql: |
+    SELECT count(*) AS purchase_orders, sum(total_amount) AS value
+    FROM proc_purchase_orders
+    WHERE placed_on >= DATE '2026-07-01' AND placed_on < DATE '2026-08-01'
+
+- question: "What is pending on PO-2026-0012?"
+  format: table
+  sql: |
+    SELECT i.item_code, i.name, l.quantity_ordered, l.quantity_received,
+           GREATEST(l.quantity_ordered - l.quantity_received, 0) AS pending, l.unit
+    FROM proc_po_lines l
+    JOIN proc_purchase_orders po ON po.id = l.po_id
+    JOIN inv_items i ON i.id = l.inv_item_id
+    WHERE po.po_number = 'PO-2026-0012'
+    ORDER BY l.position
+
+- question: "Do different suppliers charge us different prices for the same item?"
+  format: table
+  sql: |
+    WITH prices AS (
+      SELECT l.inv_item_id, v.name AS supplier, min(l.unit_price) AS min_price,
+             max(l.unit_price) AS max_price, max(po.placed_on) AS last_ordered
+      FROM proc_po_lines l
+      JOIN proc_purchase_orders po ON po.id = l.po_id
+      JOIN proc_vendors v ON v.id = po.vendor_id
+      GROUP BY l.inv_item_id, v.name
+    )
+    SELECT i.item_code, i.name, p.supplier, p.min_price, p.max_price, p.last_ordered
+    FROM prices p
+    JOIN inv_items i ON i.id = p.inv_item_id
+    WHERE p.inv_item_id IN (SELECT inv_item_id FROM prices GROUP BY inv_item_id HAVING count(*) > 1)
+    ORDER BY i.name, p.min_price
+
+- question: "Which supplier payments are still outstanding?"
+  format: table
+  sql: |
+    SELECT po.po_number, v.name AS supplier, t.stage,
+           coalesce(t.amount, round(t.percentage / 100 * po.total_amount, 2)) AS amount
+    FROM proc_po_payment_tranches t
+    JOIN proc_purchase_orders po ON po.id = t.po_id
+    JOIN proc_vendors v ON v.id = po.vendor_id
+    WHERE t.cleared_at IS NULL
+    ORDER BY amount DESC
+  caveats:
+    - text: "{n} purchase orders have no payment schedule recorded and are not included."
+      sql: |
+        SELECT count(*) FROM proc_purchase_orders po
+        WHERE NOT EXISTS (SELECT 1 FROM proc_po_payment_tranches t WHERE t.po_id = po.id)
+
+- question: "List deliveries that came in without a purchase order."
+  format: table
+  sql: |
+    SELECT h.vendor_name AS supplier, h.received_at::date AS received, i.item_code, i.name, u.quantity, i.unit
+    FROM proc_unexpected_receipts u
+    JOIN proc_unexpected_receipt_headers h ON h.id = u.header_id
+    JOIN inv_items i ON i.id = u.inv_item_id
+    WHERE u.resolved_po_id IS NULL
+    ORDER BY h.received_at
+
+- question: "Break down purchases by item category."
+  format: chart
+  sql: |
+    SELECT coalesce(c.name, 'Not recorded') AS category, sum(l.line_total) AS spend
+    FROM proc_po_lines l
+    JOIN inv_items i ON i.id = l.inv_item_id
+    LEFT JOIN inv_categories c ON c.id = i.category_id
+    GROUP BY 1
+    ORDER BY spend DESC
+
+# ------------------------------------------------------------------ owner (cross-functional)
+
+- question: "What is short on stock with nothing on order?"
+  format: table
+  sql: |
+    SELECT i.item_code, i.name, l.name AS warehouse, s.quantity, s.min_stock_level, i.unit
+    FROM inv_current_stock s
+    JOIN inv_items i ON i.id = s.item_id
+    JOIN inv_locations l ON l.id = s.location_id
+    WHERE s.min_stock_level > 0 AND s.quantity < s.min_stock_level
+      AND NOT EXISTS (
+        SELECT 1 FROM proc_po_lines pl
+        JOIN proc_purchase_orders po ON po.id = pl.po_id
+        WHERE pl.inv_item_id = s.item_id AND po.status IN ('placed', 'partial'))
+    ORDER BY s.min_stock_level - s.quantity DESC
+  caveats:
+    - text: "{n} stock rows have no reorder level set and were not checked."
+      sql: "SELECT count(*) FROM inv_current_stock WHERE min_stock_level = 0"
+
+- question: "For low-stock items, who supplied them last and at what price?"
+  format: table
+  sql: |
+    WITH last_buy AS (
+      SELECT DISTINCT ON (pl.inv_item_id) pl.inv_item_id, v.name AS supplier, pl.unit_price, po.placed_on
+      FROM proc_po_lines pl
+      JOIN proc_purchase_orders po ON po.id = pl.po_id
+      JOIN proc_vendors v ON v.id = po.vendor_id
+      ORDER BY pl.inv_item_id, po.placed_on DESC, pl.created_at DESC
+    )
+    SELECT i.item_code, i.name, l.name AS warehouse, s.quantity, s.min_stock_level,
+           lb.supplier AS last_supplier, lb.unit_price AS last_price, lb.placed_on AS last_ordered
+    FROM inv_current_stock s
+    JOIN inv_items i ON i.id = s.item_id
+    JOIN inv_locations l ON l.id = s.location_id
+    JOIN last_buy lb ON lb.inv_item_id = s.item_id
+    WHERE s.min_stock_level > 0 AND s.quantity < s.min_stock_level
+    ORDER BY lb.supplier, i.item_code
+  caveats:
+    - text: "{n} low-stock rows are for items never bought on a PO, so they have no supplier and are not listed."
+      sql: |
+        SELECT count(*) FROM inv_current_stock s
+        WHERE s.min_stock_level > 0 AND s.quantity < s.min_stock_level
+          AND NOT EXISTS (SELECT 1 FROM proc_po_lines pl WHERE pl.inv_item_id = s.item_id)
+
+- question: "What is our inventory worth?"
+  format: text
+  sql: |
+    WITH last_price AS (
+      SELECT DISTINCT ON (pl.inv_item_id) pl.inv_item_id, pl.unit_price
+      FROM proc_po_lines pl
+      JOIN proc_purchase_orders po ON po.id = pl.po_id
+      JOIN inv_items i ON i.id = pl.inv_item_id
+      WHERE pl.unit = i.unit AND pl.unit_price IS NOT NULL
+      ORDER BY pl.inv_item_id, po.placed_on DESC, pl.created_at DESC
+    )
+    SELECT round(sum(s.quantity * lp.unit_price)) AS stock_value_inr, count(*) AS stock_rows_valued
+    FROM inv_current_stock s
+    JOIN last_price lp ON lp.inv_item_id = s.item_id
+    WHERE s.quantity > 0
+  caveats:
+    - text: "{n} stock rows have no PO price in the item's own unit; they are not included in the value."
+      sql: |
+        SELECT count(*) FROM inv_current_stock s
+        JOIN inv_items i ON i.id = s.item_id
+        WHERE s.quantity > 0
+          AND NOT EXISTS (SELECT 1 FROM proc_po_lines pl
+                          WHERE pl.inv_item_id = s.item_id AND pl.unit = i.unit AND pl.unit_price IS NOT NULL)
+
+- question: "Are we receiving more than we issue each month?"
+  format: chart
+  sql: |
+    SELECT to_char(date_trunc('month', created_at), 'YYYY-MM') AS month,
+           count(*) FILTER (WHERE transaction_type = 'inbound') AS receipts,
+           count(*) FILTER (WHERE transaction_type = 'outbound') AS issues
+    FROM inv_transactions
+    WHERE transaction_type IN ('inbound', 'outbound')
+      AND created_at >= date_trunc('month', DATE '{as_of}') - INTERVAL '6 months'
+    GROUP BY 1
+    ORDER BY 1

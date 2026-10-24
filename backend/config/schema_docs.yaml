@@ -1,0 +1,224 @@
+# Business meaning of the tables, used to build the agent's schema context.
+#
+# The context for a role is filtered: only its allowed tables, without its excluded
+# columns, and only joins/definitions whose tables it can see. Column types come
+# from app/db/models.py; columns not described here are listed by name and type,
+# except those in skip_columns.
+# Background: docs/data_model.md (which tables matter), docs/assumptions.md (policy).
+
+rules:
+  - "Today is {as_of}. Never use CURRENT_DATE, NOW() or CURRENT_TIMESTAMP; use DATE '{as_of}'. Data ends on that date."
+  - "Money is INR. Spend is before GST (tax is 0 on every PO). Format large amounts in lakhs/crores in the answer, not in SQL."
+  - "Totals, trends or breakdowns of stock moved across many items (by month, department, warehouse): count movements and distinct items by default; show quantities per unit only if the user asks for a unit."
+  - "Quantities are only added, compared or ranked within one unit (pcs, kg, mtr, ...). For 'most/top by quantity' across items, rank within each unit (ROW_NUMBER() OVER (PARTITION BY unit ...)) or compare by INR value. Always return the unit column next to a quantity."
+  - "Match items by name with ILIKE and also accept 'x' for '×' in sizes (e.g. 1250x2500 = 1250×2500). Item names can have trailing spaces: compare trimmed names."
+  - "IDs are internal UUIDs. Show item_code / po_number / names instead, never ids."
+  - "Filter on names (items, suppliers, departments, warehouses) with ILIKE '%...%', not '=', unless the exact value is listed in these docs."
+  - "Missing values: never guess. Exclude rows missing a needed value and count them for a caveat; group a missing category as 'Not recorded'."
+
+skip_columns:
+  - created_by
+  - received_by
+  - cleared_by
+  - regularised_by
+  - reviewed_by
+  - resolved_by
+  - is_synthetic
+  - custom_fields
+  - specifications
+  - alt_units
+  - position
+  - currency
+
+# Business definitions (docs/assumptions.md). Each is shown only to roles that can query all its tables.
+definitions:
+  - tables: [inv_current_stock, proc_po_lines, proc_purchase_orders]
+    text: >-
+      Stock value = quantity on hand x the item's latest PO unit price (most recent placed_on), using only PO
+      lines in the item's own unit (proc_po_lines.unit = inv_items.unit): a price per kg can't value stock counted
+      in pcs. Do not use inv_transactions.unit_cost. Items with no PO price in their own unit have no price: leave
+      them out and count them in a caveat.
+  - tables: [inv_current_stock]
+    text: "Below reorder level = quantity < min_stock_level where min_stock_level > 0 (0 means no level set)."
+  - tables: [inv_transactions]
+    text: "Consumption / issues = outbound movements. Receipts = inbound movements. Adjustments and transfers are neither."
+  - tables: [proc_purchase_orders]
+    text: "Open PO = status 'placed' or 'partial'. Overdue = open and its latest expected delivery date is before today."
+  - tables: [proc_po_receipts, proc_purchase_orders]
+    text: "Delivery delay = receipt date minus the PO's original promised date (first expected_delivery_date)."
+
+joins:
+  - inv_current_stock.item_id = inv_items.id
+  - inv_current_stock.location_id = inv_locations.id
+  - inv_transactions.item_id = inv_items.id
+  - inv_transactions.location_id = inv_locations.id
+  - inv_transactions.issued_to_id = inv_issued_to_targets.id
+  - inv_items.category_id = inv_categories.id
+  - inv_items.sub_category_id = inv_sub_categories.id
+  - inv_items.sub_category_2_id = inv_sub_categories_2.id
+  - inv_sub_categories.category_id = inv_categories.id
+  - proc_purchase_orders.vendor_id = proc_vendors.id
+  - proc_po_lines.po_id = proc_purchase_orders.id
+  - proc_po_lines.inv_item_id = inv_items.id
+  - proc_po_receipts.po_line_id = proc_po_lines.id
+  - proc_po_receipts.location_id = inv_locations.id
+  - proc_po_payment_tranches.po_id = proc_purchase_orders.id
+  - proc_po_line_regularisations.po_line_id = proc_po_lines.id
+  - proc_unexpected_receipts.header_id = proc_unexpected_receipt_headers.id
+  - proc_unexpected_receipts.inv_item_id = inv_items.id
+  - proc_unexpected_receipts.location_id = inv_locations.id
+
+tables:
+  # ---------------------------------------------------------------- core
+  inv_items:
+    tier: core
+    description: "Item master: every part, raw material and product the company stocks or buys. 501 items."
+    columns:
+      item_code: "Business identifier shown to users, e.g. RM-MT-FS-0064 (category-subcategory-family-number)."
+      name: "Item description incl. size/grade, e.g. 'SS Sheet – 304 – 1250×2500×1.2mm'."
+      unit: "Unit of measure: pcs, kg, set, roll, pair, mtr."
+      status: "active | inactive."
+      is_spare: "true for spare parts."
+      hsn_code: "Indian tax tariff code; missing for most items, not used for analysis."
+
+  inv_current_stock:
+    tier: core
+    description: "On-hand stock now: one row per item per warehouse, with reorder (min) and max levels."
+    columns:
+      quantity: "On-hand quantity in the item's unit. Never negative."
+      min_stock_level: "Reorder level. 0 means NOT SET: exclude such rows from reorder questions and count them in a caveat."
+      max_stock_level: "Maximum stock level."
+      last_transaction_at: "Time of the last movement for this item at this warehouse."
+
+  inv_transactions:
+    tier: core
+    description: "Stock movement ledger. Sum of quantity per (item, warehouse) equals current stock."
+    columns:
+      quantity: "SIGNED: positive = stock in, negative = stock out. Use -quantity or abs(quantity) for issued amounts."
+      transaction_type: >-
+        inbound (goods received) | outbound (issued to shop floor/dispatch) |
+        adjustment (opening_balance or stock_count corrections) | transfer_in | transfer_out (between warehouses).
+      reference_type: >-
+        purchase_order (inbound against a PO; reference_id = PO id) | unexpected_receipt (inbound without a PO) |
+        warehouse_issue (outbound) | opening_balance | stock_count | transfer.
+      issued_to_id: "Department the stock was issued to (outbound only); sometimes missing -> 'Not recorded'."
+      transfer_location_id: "Other warehouse in a transfer."
+      unit_cost: "Cost per unit at the time of the movement; missing on some rows."
+      created_at: "When the movement happened."
+    notes:
+      - "Consumption / issues = transaction_type = 'outbound'. Receipts = transaction_type = 'inbound'. Adjustments and transfers are neither."
+      - "Opening balances are dated 2026-01-31; the 29 Jul 2026 physical count is a stock_count adjustment, not a receipt."
+
+  inv_locations:
+    tier: core
+    description: "Warehouses: 132-1, 132-2, 132-3, 103-1, C-84 (active) and 'Unassigned' (inactive)."
+    columns:
+      name: "Warehouse code shown to users."
+      is_active: "Exclude inactive warehouses unless asked."
+
+  proc_vendors:
+    tier: core
+    description: "Suppliers (34)."
+    columns:
+      name: "Supplier name, e.g. 'Sterling Steels Pvt. Ltd.'. Match with ILIKE."
+      city: "Supplier city."
+      payment_terms: "Free text, e.g. '30 Days Credit', '50% Advance & 50% Against Dispatch'. Missing for 10 suppliers."
+      code: "Always empty; don't use."
+      is_active: "Active supplier."
+
+  proc_purchase_orders:
+    tier: core
+    description: "Purchase order headers. Placed Feb–Aug 2026; POs numbered PO-2026-H… are history before August."
+    columns:
+      po_number: "Business identifier shown to users, e.g. PO-2026-0029."
+      status: "placed (nothing received yet) | partial (some received) | received (complete). Open = placed or partial."
+      placed_on: "Order date."
+      total_amount: "PO value in INR (= subtotal; tax is 0)."
+      payment_terms: "Free text; may be missing."
+      expected_delivery_date: >-
+        JSON array of ISO dates, one per revision. Current expectation = last element:
+        (expected_delivery_date ->> (json_array_length(expected_delivery_date) - 1))::date.
+        Original promise = (expected_delivery_date ->> 0)::date. NULL when not recorded.
+      expected_dispatch_date: "JSON array of ISO dates, same format as expected_delivery_date."
+      delivery_location_id: "Almost always empty; use receipts' location instead."
+    notes:
+      - "Overdue = status IN ('placed','partial') AND current expected delivery date < today. POs without an expected date cannot be judged: count them in a caveat."
+
+  proc_po_lines:
+    tier: core
+    description: "Items on each PO: quantity ordered vs received, and price."
+    columns:
+      quantity_ordered: "Ordered quantity, in the line's unit."
+      quantity_received: "Received so far. Can exceed ordered (over-delivery)."
+      unit: >-
+        Unit the line was ordered in: pcs, kg, set, mtr, ltr. Label PO quantities with THIS unit, not inv_items.unit:
+        a few items are counted in pcs in the item master but bought by weight, length or volume.
+      unit_price: "Price per unit in INR."
+      line_total: "quantity_ordered × unit_price (tax is 0)."
+      expected_delivery_date: "Per-line expected dates; same JSON format as the PO header."
+    notes:
+      - "Pending quantity = GREATEST(quantity_ordered - quantity_received, 0)."
+      - "Latest price of an item = unit_price on its most recent PO (by placed_on)."
+
+  # ---------------------------------------------------------------- secondary
+  inv_categories:
+    tier: secondary
+    description: "Item categories: Raw Material (RM), Bought Out (BO), Finished Goods (FG), Sub-Assembly (SUB)."
+
+  inv_sub_categories:
+    tier: secondary
+    description: "Second-level item groups, e.g. Metal, Mechanical, Electrical, Consumable."
+
+  inv_issued_to_targets:
+    tier: secondary
+    description: >-
+      Departments stock is issued to. Exact names: 'H103 Shop Floor', 'G133 Shop Floor', 'DE132 Shop floor',
+      'D132 Shop Floor' (inactive), 'Dispatch team', 'C84 Dispatch', 'C84 Electronic assembly', 'C84 FM assembly'.
+      "Shop floor" means the names containing 'shop floor'.
+
+  proc_po_receipts:
+    tier: secondary
+    description: "Deliveries received against PO lines (one line can arrive in several deliveries)."
+    columns:
+      quantity: "Quantity delivered."
+      received_at: "Delivery time."
+      notes: "Usually the supplier invoice number."
+    notes:
+      - "Delivery delay in days = received_at::date - original promised date of the PO ((expected_delivery_date ->> 0)::date). Positive = late."
+
+  proc_po_payment_tranches:
+    tier: secondary
+    description: "Payment schedule of a PO split into stages (advance, against dispatch, credit). Not every PO has one."
+    columns:
+      percentage: "Share of the PO value; tranches of a PO add up to 100."
+      amount: "Amount in INR; if NULL derive as percentage / 100 × PO total_amount."
+      due_basis: "advance | dispatch | credit."
+      due_offset_days: "Days after the due basis (e.g. 30 days credit)."
+      cleared_at: "When paid; NULL = not paid yet."
+
+  proc_unexpected_receipt_headers:
+    tier: secondary
+    description: "Deliveries that arrived without a PO (one per supplier invoice)."
+    columns:
+      vendor_name: "Free text supplier name, NOT linked to proc_vendors."
+      received_at: "Arrival time."
+
+  proc_unexpected_receipts:
+    tier: secondary
+    description: "Items in deliveries that arrived without a PO. Resolved once linked to a PO (none are yet)."
+    columns:
+      quantity: "Quantity received."
+      resolved_po_id: "PO it was matched to; NULL = still to be regularised."
+
+  # ---------------------------------------------------------------- rare
+  inv_sub_categories_2:
+    tier: rare
+    description: "Item families with naming standards (e.g. Flat Sheet, Hexalobular Screw). Reference data."
+
+  inv_field_definitions:
+    tier: rare
+    description: "Configuration of custom item fields (alias, source, legacy code). Not operational data."
+
+  proc_po_line_regularisations:
+    tier: rare
+    description: "Quantity corrections on PO lines that were over- or under-delivered (5 rows)."

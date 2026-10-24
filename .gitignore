@@ -1,0 +1,31 @@
+# secrets
+.env
+.env.*
+!.env.example
+
+# python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# node
+node_modules/
+.next/
+
+# local data
+*.dump
+*.sql.gz
+dumps/
+.DS_Store
+
+# local assistant instructions
+CLAUDE.md
+.claude/
+
+.vscode/
+
+# eval run outputs
+backend/evals/results/
+backend/.cache/
+backend/logs/
