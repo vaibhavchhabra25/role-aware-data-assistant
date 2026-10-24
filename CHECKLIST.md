@@ -89,4 +89,4 @@ _Writes deferred on 2026-10-15, built on 2026-10-16 with the agreed defaults (tw
 - [x] Optional OpenAI-compatible provider (`LLM_BASE_URL`, `LLM_API_KEY`); OpenAI case-study key revoked, local runs use Groq gpt-oss-120b/20b
 - [x] Format prompt: totals after a top-N cut are never called "all" (found while checking a screenshot)
 - [ ] Live site: needs a working LLM key on Railway (OpenAI key revoked)
-- [x] Public portfolio repo (2026-10-25): https://github.com/vaibhavchhabra25/role-aware-data-assistant, one clean commit; raw sample rows stripped from docs/schema.md (samples now opt-in with --samples); secrets scan clean. This private repo keeps full history and the deployment
+- [x] Public portfolio repo (2026-10-25): https://github.com/vaibhavchhabra25/role-aware-data-assistant, one clean commit; raw sample rows stripped from docs/schema.md (samples now opt-in with --samples); secrets scan clean. This is now the only active repo: deployments are CLI pushes from it, and the old private repo is archived (full history there, plus local branch `private-history`)
